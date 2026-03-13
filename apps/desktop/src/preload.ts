@@ -4,6 +4,10 @@ import type { DesktopBridge } from "@t3tools/contracts";
 const PICK_FOLDER_CHANNEL = "desktop:pick-folder";
 const CONFIRM_CHANNEL = "desktop:confirm";
 const SET_THEME_CHANNEL = "desktop:set-theme";
+const MARK_OPEN_PROJECT_PATH_LISTENER_READY_CHANNEL =
+  "desktop:mark-open-project-path-listener-ready";
+const GET_PENDING_OPEN_PROJECT_PATHS_CHANNEL = "desktop:get-pending-open-project-paths";
+const OPEN_PROJECT_PATH_CHANNEL = "desktop:open-project-path";
 const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
 const OPEN_EXTERNAL_CHANNEL = "desktop:open-external";
 const MENU_ACTION_CHANNEL = "desktop:menu-action";
@@ -18,6 +22,20 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   pickFolder: () => ipcRenderer.invoke(PICK_FOLDER_CHANNEL),
   confirm: (message) => ipcRenderer.invoke(CONFIRM_CHANNEL, message),
   setTheme: (theme) => ipcRenderer.invoke(SET_THEME_CHANNEL, theme),
+  markOpenProjectPathListenerReady: () =>
+    ipcRenderer.invoke(MARK_OPEN_PROJECT_PATH_LISTENER_READY_CHANNEL),
+  getPendingOpenProjectPaths: () => ipcRenderer.invoke(GET_PENDING_OPEN_PROJECT_PATHS_CHANNEL),
+  onOpenProjectPath: (listener) => {
+    const wrappedListener = (_event: Electron.IpcRendererEvent, path: unknown) => {
+      if (typeof path !== "string") return;
+      listener(path);
+    };
+
+    ipcRenderer.on(OPEN_PROJECT_PATH_CHANNEL, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(OPEN_PROJECT_PATH_CHANNEL, wrappedListener);
+    };
+  },
   showContextMenu: (items, position) => ipcRenderer.invoke(CONTEXT_MENU_CHANNEL, items, position),
   openExternal: (url: string) => ipcRenderer.invoke(OPEN_EXTERNAL_CHANNEL, url),
   onMenuAction: (listener) => {

@@ -294,6 +294,8 @@ export default function Sidebar() {
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
   const addProjectInputRef = useRef<HTMLInputElement | null>(null);
+  const addProjectFromPathRef = useRef<(cwd: string) => Promise<void>>(async () => undefined);
+  const desktopOpenProjectQueueRef = useRef(Promise.resolve());
   const [renamingThreadId, setRenamingThreadId] = useState<ThreadId | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
   const [expandedThreadListsByProject, setExpandedThreadListsByProject] = useState<
@@ -466,6 +468,16 @@ export default function Sidebar() {
       shouldBrowseForProjectImmediately,
     ],
   );
+
+  useEffect(() => {
+    addProjectFromPathRef.current = addProjectFromPath;
+  }, [addProjectFromPath]);
+
+  const enqueueDesktopOpenProjectPath = useCallback((cwd: string) => {
+    desktopOpenProjectQueueRef.current = desktopOpenProjectQueueRef.current
+      .then(() => addProjectFromPathRef.current(cwd))
+      .catch(() => undefined);
+  }, []);
 
   const handleAddProject = () => {
     void addProjectFromPath(newCwd);
@@ -961,6 +973,48 @@ export default function Sidebar() {
       window.removeEventListener("mousedown", onMouseDown);
     };
   }, [clearSelection, selectedThreadIds.size]);
+
+  useEffect(() => {
+    if (!isElectron) return;
+    const bridge = window.desktopBridge;
+    if (
+      !bridge ||
+      typeof bridge.markOpenProjectPathListenerReady !== "function" ||
+      typeof bridge.getPendingOpenProjectPaths !== "function" ||
+      typeof bridge.onOpenProjectPath !== "function"
+    ) {
+      return;
+    }
+
+    let disposed = false;
+    const handleOpenProjectPath = (path: string) => {
+      const normalizedPath = path.trim();
+      if (disposed || normalizedPath.length === 0) {
+        return;
+      }
+      enqueueDesktopOpenProjectPath(normalizedPath);
+    };
+
+    const unsubscribe = bridge.onOpenProjectPath(handleOpenProjectPath);
+
+    void bridge
+      .markOpenProjectPathListenerReady()
+      .then(() => bridge.getPendingOpenProjectPaths())
+      .then((paths) => {
+        if (disposed) return;
+        for (const path of paths) {
+          if (typeof path === "string") {
+            handleOpenProjectPath(path);
+          }
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [enqueueDesktopOpenProjectPath]);
 
   useEffect(() => {
     if (!isElectron) return;

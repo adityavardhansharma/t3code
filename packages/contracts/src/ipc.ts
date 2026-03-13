@@ -99,6 +99,9 @@ export interface DesktopBridge {
   pickFolder: () => Promise<string | null>;
   confirm: (message: string) => Promise<boolean>;
   setTheme: (theme: DesktopTheme) => Promise<void>;
+  markOpenProjectPathListenerReady: () => Promise<void>;
+  getPendingOpenProjectPaths: () => Promise<string[]>;
+  onOpenProjectPath: (listener: (path: string) => void) => () => void;
   showContextMenu: <T extends string>(
     items: readonly ContextMenuItem<T>[],
     position?: { x: number; y: number },

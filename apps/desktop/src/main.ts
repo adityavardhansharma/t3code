@@ -30,6 +30,7 @@ import { RotatingFileSink } from "@t3tools/shared/logging";
 import { showDesktopConfirmDialog } from "./confirmDialog";
 import { fixPath } from "./fixPath";
 import { getAutoUpdateDisabledReason, shouldBroadcastDownloadProgress } from "./updateState";
+import { extractProjectLaunchPathFromArgv } from "./windowsProjectLaunch";
 import {
   createInitialDesktopUpdateState,
   reduceDesktopUpdateStateOnCheckFailure,
@@ -49,6 +50,10 @@ fixPath();
 const PICK_FOLDER_CHANNEL = "desktop:pick-folder";
 const CONFIRM_CHANNEL = "desktop:confirm";
 const SET_THEME_CHANNEL = "desktop:set-theme";
+const MARK_OPEN_PROJECT_PATH_LISTENER_READY_CHANNEL =
+  "desktop:mark-open-project-path-listener-ready";
+const GET_PENDING_OPEN_PROJECT_PATHS_CHANNEL = "desktop:get-pending-open-project-paths";
+const OPEN_PROJECT_PATH_CHANNEL = "desktop:open-project-path";
 const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
 const OPEN_EXTERNAL_CHANNEL = "desktop:open-external";
 const MENU_ACTION_CHANNEL = "desktop:menu-action";
@@ -75,6 +80,7 @@ const AUTO_UPDATE_STARTUP_DELAY_MS = 15_000;
 const AUTO_UPDATE_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const DESKTOP_UPDATE_CHANNEL = "latest";
 const DESKTOP_UPDATE_ALLOW_PRERELEASE = false;
+const SHOULD_HANDLE_WINDOWS_PROJECT_LAUNCH = process.platform === "win32";
 
 type DesktopUpdateErrorContext = DesktopUpdateState["errorContext"];
 
@@ -91,6 +97,8 @@ let aboutCommitHashCache: string | null | undefined;
 let desktopLogSink: RotatingFileSink | null = null;
 let backendLogSink: RotatingFileSink | null = null;
 let restoreStdIoCapture: (() => void) | null = null;
+let openProjectPathListenerReady = false;
+const pendingOpenProjectPaths: string[] = [];
 
 let destructiveMenuIconCache: Electron.NativeImage | null | undefined;
 const desktopRuntimeInfo = resolveDesktopRuntimeInfo({
@@ -100,6 +108,15 @@ const desktopRuntimeInfo = resolveDesktopRuntimeInfo({
 });
 const initialUpdateState = (): DesktopUpdateState =>
   createInitialDesktopUpdateState(app.getVersion(), desktopRuntimeInfo);
+const hasSingleInstanceLock =
+  !SHOULD_HANDLE_WINDOWS_PROJECT_LAUNCH || app.requestSingleInstanceLock();
+
+if (SHOULD_HANDLE_WINDOWS_PROJECT_LAUNCH) {
+  const initialProjectLaunchPath = extractProjectLaunchPathFromArgv(process.argv);
+  if (initialProjectLaunchPath) {
+    pendingOpenProjectPaths.push(initialProjectLaunchPath);
+  }
+}
 
 function logTimestamp(): string {
   return new Date().toISOString();
@@ -1050,6 +1067,62 @@ async function stopBackendAndWaitForExit(timeoutMs = 5_000): Promise<void> {
   });
 }
 
+function queueOpenProjectPath(path: string): void {
+  if (pendingOpenProjectPaths.includes(path)) {
+    return;
+  }
+  pendingOpenProjectPaths.push(path);
+}
+
+function takePendingOpenProjectPaths(): string[] {
+  const paths = [...pendingOpenProjectPaths];
+  pendingOpenProjectPaths.length = 0;
+  return paths;
+}
+
+function revealMainWindow(): void {
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) {
+    return;
+  }
+
+  if (window.isMinimized()) {
+    window.restore();
+  }
+  if (!window.isVisible()) {
+    window.show();
+  }
+  window.focus();
+}
+
+function dispatchOpenProjectPath(path: string): void {
+  const window = mainWindow;
+  if (
+    !window ||
+    window.isDestroyed() ||
+    !openProjectPathListenerReady ||
+    window.webContents.isLoadingMainFrame()
+  ) {
+    queueOpenProjectPath(path);
+    return;
+  }
+
+  window.webContents.send(OPEN_PROJECT_PATH_CHANNEL, path);
+}
+
+function handleOpenProjectPath(path: string): void {
+  if (!path) {
+    return;
+  }
+
+  if ((!mainWindow || mainWindow.isDestroyed()) && app.isReady()) {
+    mainWindow = createWindow();
+  }
+
+  revealMainWindow();
+  dispatchOpenProjectPath(path);
+}
+
 function registerIpcHandlers(): void {
   ipcMain.removeHandler(PICK_FOLDER_CHANNEL);
   ipcMain.handle(PICK_FOLDER_CHANNEL, async () => {
@@ -1084,6 +1157,14 @@ function registerIpcHandlers(): void {
 
     nativeTheme.themeSource = theme;
   });
+
+  ipcMain.removeHandler(MARK_OPEN_PROJECT_PATH_LISTENER_READY_CHANNEL);
+  ipcMain.handle(MARK_OPEN_PROJECT_PATH_LISTENER_READY_CHANNEL, async () => {
+    openProjectPathListenerReady = true;
+  });
+
+  ipcMain.removeHandler(GET_PENDING_OPEN_PROJECT_PATHS_CHANNEL);
+  ipcMain.handle(GET_PENDING_OPEN_PROJECT_PATHS_CHANNEL, async () => takePendingOpenProjectPaths());
 
   ipcMain.removeHandler(CONTEXT_MENU_CHANNEL);
   ipcMain.handle(
@@ -1200,6 +1281,8 @@ function getIconOption(): { icon: string } | Record<string, never> {
 }
 
 function createWindow(): BrowserWindow {
+  openProjectPathListenerReady = false;
+
   const window = new BrowserWindow({
     width: 1100,
     height: 780,
@@ -1277,6 +1360,7 @@ function createWindow(): BrowserWindow {
   window.on("closed", () => {
     if (mainWindow === window) {
       mainWindow = null;
+      openProjectPathListenerReady = false;
     }
   });
 
@@ -1311,60 +1395,74 @@ async function bootstrap(): Promise<void> {
   writeDesktopLogHeader("bootstrap main window created");
 }
 
-app.on("before-quit", () => {
-  isQuitting = true;
-  writeDesktopLogHeader("before-quit received");
-  clearUpdatePollTimer();
-  stopBackend();
-  restoreStdIoCapture?.();
-});
-
-app
-  .whenReady()
-  .then(() => {
-    writeDesktopLogHeader("app ready");
-    configureAppIdentity();
-    configureApplicationMenu();
-    registerDesktopProtocol();
-    configureAutoUpdater();
-    void bootstrap().catch((error) => {
-      handleFatalStartupError("bootstrap", error);
-    });
-
-    app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        mainWindow = createWindow();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  if (SHOULD_HANDLE_WINDOWS_PROJECT_LAUNCH) {
+    app.on("second-instance", (_event, argv) => {
+      revealMainWindow();
+      const projectLaunchPath = extractProjectLaunchPathFromArgv(argv);
+      if (projectLaunchPath) {
+        handleOpenProjectPath(projectLaunchPath);
       }
     });
-  })
-  .catch((error) => {
-    handleFatalStartupError("whenReady", error);
-  });
-
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
   }
-});
 
-if (process.platform !== "win32") {
-  process.on("SIGINT", () => {
-    if (isQuitting) return;
+  app.on("before-quit", () => {
     isQuitting = true;
-    writeDesktopLogHeader("SIGINT received");
+    writeDesktopLogHeader("before-quit received");
     clearUpdatePollTimer();
     stopBackend();
     restoreStdIoCapture?.();
-    app.quit();
   });
 
-  process.on("SIGTERM", () => {
-    if (isQuitting) return;
-    isQuitting = true;
-    writeDesktopLogHeader("SIGTERM received");
-    clearUpdatePollTimer();
-    stopBackend();
-    restoreStdIoCapture?.();
-    app.quit();
+  app
+    .whenReady()
+    .then(() => {
+      writeDesktopLogHeader("app ready");
+      configureAppIdentity();
+      configureApplicationMenu();
+      registerDesktopProtocol();
+      configureAutoUpdater();
+      void bootstrap().catch((error) => {
+        handleFatalStartupError("bootstrap", error);
+      });
+
+      app.on("activate", () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          mainWindow = createWindow();
+        }
+      });
+    })
+    .catch((error) => {
+      handleFatalStartupError("whenReady", error);
+    });
+
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") {
+      app.quit();
+    }
   });
+
+  if (process.platform !== "win32") {
+    process.on("SIGINT", () => {
+      if (isQuitting) return;
+      isQuitting = true;
+      writeDesktopLogHeader("SIGINT received");
+      clearUpdatePollTimer();
+      stopBackend();
+      restoreStdIoCapture?.();
+      app.quit();
+    });
+
+    process.on("SIGTERM", () => {
+      if (isQuitting) return;
+      isQuitting = true;
+      writeDesktopLogHeader("SIGTERM received");
+      clearUpdatePollTimer();
+      stopBackend();
+      restoreStdIoCapture?.();
+      app.quit();
+    });
+  }
 }
