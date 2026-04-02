@@ -1510,7 +1510,15 @@ export function ArchivedThreadsPanel() {
     if (ids.length === 0) return;
     const deletedIds = new Set<ThreadId>(ids);
     for (const threadId of ids) {
-      await deleteThread(threadId, { deletedThreadIds: deletedIds });
+      try {
+        await deleteThread(threadId, { deletedThreadIds: deletedIds });
+      } catch (error) {
+        toastManager.add({
+          type: "error",
+          title: "Failed to delete thread",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
+      }
     }
     setSelectedArchivedIds(new Set());
   }, [deleteThread, selectedArchivedIds]);
@@ -1528,6 +1536,12 @@ export function ArchivedThreadsPanel() {
     void (async () => {
       try {
         await executeBulkDeleteArchived();
+      } catch (error) {
+        toastManager.add({
+          type: "error",
+          title: "Failed to delete threads",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
       } finally {
         setBulkDeleteDialogOpen(false);
       }
